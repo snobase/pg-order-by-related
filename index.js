@@ -1,4 +1,17 @@
-function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
+function PgOrderByRelatedPlugin(
+  builder,
+  { orderByRelatedColumnAggregates, orderByRelatedMaxDepth = 1 }
+) {
+  if (
+    !Number.isInteger(orderByRelatedMaxDepth) ||
+    orderByRelatedMaxDepth < 1 ||
+    orderByRelatedMaxDepth > 5
+  ) {
+    throw new Error(
+      "orderByRelatedMaxDepth must be an integer between 1 and 5"
+    );
+  }
+
   builder.hook("build", (build) => {
     const pkg = require("./package.json");
 
@@ -102,6 +115,24 @@ function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
       return values;
     }
 
+    const tableOrderByRelatedMaxDepthTag = table.tags.orderByRelatedMaxDepth;
+    const tableOrderByRelatedMaxDepth =
+      tableOrderByRelatedMaxDepthTag === undefined
+        ? orderByRelatedMaxDepth
+        : Number(tableOrderByRelatedMaxDepthTag);
+    if (
+      (tableOrderByRelatedMaxDepthTag !== undefined &&
+        typeof tableOrderByRelatedMaxDepthTag !== "string" &&
+        typeof tableOrderByRelatedMaxDepthTag !== "number") ||
+      !Number.isInteger(tableOrderByRelatedMaxDepth) ||
+      tableOrderByRelatedMaxDepth < 1 ||
+      tableOrderByRelatedMaxDepth > 5
+    ) {
+      throw new Error(
+        `orderByRelatedMaxDepth for table '${table.name}' must be an integer between 1 and 5`
+      );
+    }
+
     const backwardRelationSpecs = table.foreignConstraints
       .filter((con) => con.type === "f")
       .reduce((memo, foreignConstraint) => {
@@ -179,7 +210,23 @@ function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
         return memo;
       }, []);
 
-    const orderEnumValuesFromRelationSpec = (relationSpec) => {
+    const sqlKeysMatchForRelationSpec = (
+      relationSpec,
+      tableAlias,
+      foreignTableAlias
+    ) =>
+      sql.fragment`(${sql.join(
+        relationSpec.keyAttributes.map((attr, i) => {
+          return sql.fragment`${tableAlias}.${sql.identifier(
+            attr.name
+          )} = ${foreignTableAlias}.${sql.identifier(
+            relationSpec.foreignKeyAttributes[i].name
+          )}`;
+        }),
+        ") and ("
+      )})`;
+
+    const orderEnumValuesFromRelationSpec = (relationSpec, relationPath) => {
       const {
         keyAttributes,
         foreignTable,
@@ -189,17 +236,11 @@ function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
       } = relationSpec;
 
       const sqlKeysMatch = (tableAlias) =>
-        sql.fragment`(${sql.join(
-          keyAttributes.map((attr, i) => {
-            return sql.fragment`${tableAlias}.${sql.identifier(
-              attr.name
-            )} = ${sql.identifier(
-              foreignTable.namespace.name,
-              foreignTable.name
-            )}.${sql.identifier(foreignKeyAttributes[i].name)}`;
-          }),
-          ") and ("
-        )})`;
+        sqlKeysMatchForRelationSpec(
+          relationSpec,
+          tableAlias,
+          sql.identifier(foreignTable.namespace.name, foreignTable.name)
+        );
 
       const inflectionKeyAttributes = isForward
         ? keyAttributes
@@ -306,13 +347,15 @@ function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
               attr,
               true,
               foreignTable,
-              inflectionKeyAttributes
+              inflectionKeyAttributes,
+              relationPath
             );
             const descEnumName = inflection.orderByRelatedColumnEnum(
               attr,
               false,
               foreignTable,
-              inflectionKeyAttributes
+              inflectionKeyAttributes,
+              relationPath
             );
 
             const sqlSubselect = ({ queryBuilder }) => sql.fragment`(
@@ -412,14 +455,16 @@ function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
               proc,
               true,
               foreignTable,
-              inflectionKeyAttributes
+              inflectionKeyAttributes,
+              relationPath
             );
             const descEnumName = inflection.orderByRelatedComputedColumnEnum(
               pseudoColumnName,
               proc,
               false,
               foreignTable,
-              inflectionKeyAttributes
+              inflectionKeyAttributes,
+              relationPath
             );
 
             const sqlSubselect = ({ queryBuilder }) => sql.fragment`(
@@ -467,8 +512,109 @@ function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
         extend(enumValues, computedColumnEnumValues);
       }
 
+      if (!isOneToMany && relationPath.length < tableOrderByRelatedMaxDepth) {
+        const foreignTableAlias = sql.identifier(Symbol());
+        const nestedEnumValues = getSingularRelationSpecs(foreignTable)
+          .filter(
+            (nestedRelationSpec) =>
+              !relationPath.some(
+                (relationSpec) =>
+                  relationSpec.table.id ===
+                    nestedRelationSpec.foreignTable.id ||
+                  relationSpec.foreignTable.id ===
+                    nestedRelationSpec.foreignTable.id
+              )
+          )
+          .reduce((memo, nestedRelationSpec) => {
+            const nestedRelationPath = [...relationPath, nestedRelationSpec];
+
+            return Object.entries(
+              orderEnumValuesFromRelationSpec(
+                nestedRelationSpec,
+                nestedRelationPath
+              )
+            ).reduce((nestedMemo, [enumName, enumValue]) => {
+              const [[sqlSubselect, ascending]] = enumValue.value.specs;
+              const nestedSqlSubselect = ({ queryBuilder }) => sql.fragment`(
+                select ${sqlSubselect({
+                  queryBuilder: { getTableAlias: () => foreignTableAlias },
+                })}
+                from ${sql.identifier(
+                  foreignTable.namespace.name,
+                  foreignTable.name
+                )} as ${foreignTableAlias}
+                where ${sqlKeysMatchForRelationSpec(
+                  relationSpec,
+                  queryBuilder.getTableAlias(),
+                  foreignTableAlias
+                )}
+              )`;
+
+              return extend(nestedMemo, {
+                [enumName]: {
+                  ...enumValue,
+                  value: {
+                    ...enumValue.value,
+                    specs: [[nestedSqlSubselect, ascending]],
+                  },
+                },
+              });
+            }, memo);
+          }, {});
+        extend(enumValues, nestedEnumValues);
+      }
+
       return enumValues;
     };
+
+    const getSingularRelationSpecs = (relationTable) =>
+      [
+        ...relationTable.constraints
+          .filter((constraint) => constraint.type === "f")
+          .map((constraint) => ({
+            table: relationTable,
+            keyAttributes: constraint.keyAttributes,
+            foreignTable: constraint.foreignClass,
+            foreignKeyAttributes: constraint.foreignKeyAttributes,
+            relationConstraint: constraint,
+            isForward: true,
+          })),
+        ...relationTable.foreignConstraints
+          .filter(
+            (foreignConstraint) =>
+              foreignConstraint.type === "f" &&
+              foreignConstraint.class.constraints.some(
+                (constraint) =>
+                  (constraint.type === "p" || constraint.type === "u") &&
+                  constraint.keyAttributeNums.length ===
+                    foreignConstraint.keyAttributes.length &&
+                  constraint.keyAttributeNums.every(
+                    (attributeNumber, index) =>
+                      foreignConstraint.keyAttributes[index].num ===
+                      attributeNumber
+                  )
+              )
+          )
+          .map((foreignConstraint) => ({
+            table: relationTable,
+            keyAttributes: foreignConstraint.foreignKeyAttributes,
+            foreignTable: foreignConstraint.class,
+            foreignKeyAttributes: foreignConstraint.keyAttributes,
+            relationConstraint: foreignConstraint,
+            isForward: false,
+          })),
+      ].filter(
+        ({
+          relationConstraint,
+          foreignTable,
+          keyAttributes,
+          foreignKeyAttributes,
+        }) =>
+          !omit(relationConstraint, "read") &&
+          !omit(foreignTable, "read") &&
+          !keyAttributes.some((attribute) => omit(attribute, "read")) &&
+          !foreignKeyAttributes.some((attribute) => omit(attribute, "read"))
+      );
 
     return extend(
       values,
@@ -476,7 +622,8 @@ function PgOrderByRelatedPlugin(builder, { orderByRelatedColumnAggregates }) {
         ...forwardRelationSpecs.map((spec) => ({ ...spec, isForward: true })),
         ...backwardRelationSpecs.map((spec) => ({ ...spec, isForward: false })),
       ].reduce(
-        (memo, spec) => extend(memo, orderEnumValuesFromRelationSpec(spec)),
+        (memo, spec) =>
+          extend(memo, orderEnumValuesFromRelationSpec(spec, [spec])),
         {}
       ),
       `Adding related column order values for table '${table.name}'`
