@@ -1,6 +1,46 @@
+const joinStateSymbol = Symbol("pgOrderByRelatedJoinState");
+
+function addQueryBuilderJoinForPostGraphileV4(queryBuilder, join) {
+  const incompatible = () => {
+    throw new Error(
+      "orderByRelatedUseJoins requires the graphile-build-pg 4.14 QueryBuilder join storage"
+    );
+  };
+
+  if (
+    !queryBuilder ||
+    !queryBuilder.locks ||
+    !Object.prototype.hasOwnProperty.call(queryBuilder.locks, "join") ||
+    !queryBuilder.data ||
+    !Array.isArray(queryBuilder.data.join) ||
+    !queryBuilder.compiledData ||
+    !Array.isArray(queryBuilder.compiledData.join) ||
+    typeof queryBuilder.checkLock !== "function"
+  ) {
+    incompatible();
+  }
+
+  if (queryBuilder.locks.join) {
+    // QueryBuilder 4.14 locks and compiles joins immediately before it compiles
+    // order expressions. Join-backed order expressions therefore append to the
+    // already-compiled, QueryBuilder-local join list.
+    if (!queryBuilder.locks.orderBy) {
+      incompatible();
+    }
+    queryBuilder.compiledData.join.push(join);
+  } else {
+    queryBuilder.checkLock("join");
+    queryBuilder.data.join.push(join);
+  }
+}
+
 function PgOrderByRelatedPlugin(
   builder,
-  { orderByRelatedColumnAggregates, orderByRelatedMaxDepth = 1 }
+  {
+    orderByRelatedColumnAggregates,
+    orderByRelatedMaxDepth = 1,
+    orderByRelatedUseJoins = false,
+  }
 ) {
   if (
     !Number.isInteger(orderByRelatedMaxDepth) ||
@@ -33,6 +73,9 @@ function PgOrderByRelatedPlugin(
       }
     };
     depends("graphile-build-pg", "^4.3.1");
+    if (orderByRelatedUseJoins) {
+      depends("graphile-build-pg", "4.14.0");
+    }
 
     // Register this plugin
     build.versions = build.extend(build.versions, { [pkg.name]: pkg.version });
@@ -226,6 +269,59 @@ function PgOrderByRelatedPlugin(
         ") and ("
       )})`;
 
+    const relationPathCanUseJoins = (relationPath) =>
+      relationPath.every(({ foreignKeyAttributes, foreignTable }) =>
+        foreignTable.constraints.some(
+          (constraint) =>
+            !constraint.isFake &&
+            (constraint.type === "p" || constraint.type === "u") &&
+            constraint.keyAttributeNums.length ===
+              foreignKeyAttributes.length &&
+            constraint.keyAttributeNums.every(
+              (attributeNumber, index) =>
+                foreignKeyAttributes[index].num === attributeNumber
+            )
+        )
+      );
+
+    const joinedAliasForRelationPath = (queryBuilder, relationPath) => {
+      let joinState = queryBuilder[joinStateSymbol];
+      if (!joinState) {
+        joinState = { relations: new Map() };
+        Object.defineProperty(queryBuilder, joinStateSymbol, {
+          value: joinState,
+        });
+      }
+
+      let sourceAlias = queryBuilder.getTableAlias();
+      let relationNodes = joinState.relations;
+      relationPath.forEach((relationSpec) => {
+        let relationNode = relationNodes.get(relationSpec);
+        if (!relationNode) {
+          const alias = sql.identifier(
+            Symbol(`order_by_related_${relationSpec.foreignTable.name}`)
+          );
+          addQueryBuilderJoinForPostGraphileV4(
+            queryBuilder,
+            sql.fragment`left join ${sql.identifier(
+              relationSpec.foreignTable.namespace.name,
+              relationSpec.foreignTable.name
+            )} as ${alias} on ${sqlKeysMatchForRelationSpec(
+              relationSpec,
+              sourceAlias,
+              alias
+            )}`
+          );
+          relationNode = { alias, relations: new Map() };
+          relationNodes.set(relationSpec, relationNode);
+        }
+        sourceAlias = relationNode.alias;
+        relationNodes = relationNode.relations;
+      });
+
+      return sourceAlias;
+    };
+
     const orderEnumValuesFromRelationSpec = (relationSpec, relationPath) => {
       const {
         keyAttributes,
@@ -247,6 +343,8 @@ function PgOrderByRelatedPlugin(
         : foreignKeyAttributes;
 
       const enumValues = {};
+      const useJoinsForRelationPath =
+        orderByRelatedUseJoins && relationPathCanUseJoins(relationPath);
 
       if (!isForward && isOneToMany) {
         // Count
@@ -366,6 +464,17 @@ function PgOrderByRelatedPlugin(
             )}
             where ${sqlKeysMatch(queryBuilder.getTableAlias())}
             )`;
+            const sqlOrderExpression = useJoinsForRelationPath
+              ? ({ queryBuilder }) => {
+                  const relatedAlias = joinedAliasForRelationPath(
+                    queryBuilder,
+                    relationPath
+                  );
+                  return sql.fragment`${relatedAlias}.${sql.identifier(
+                    attr.name
+                  )}`;
+                }
+              : sqlSubselect;
 
             memo = extend(
               memo,
@@ -373,7 +482,7 @@ function PgOrderByRelatedPlugin(
                 [ascEnumName]: {
                   value: {
                     alias: ascEnumName.toLowerCase(),
-                    specs: [[sqlSubselect, true]],
+                    specs: [[sqlOrderExpression, true]],
                   },
                 },
               },
@@ -392,7 +501,7 @@ function PgOrderByRelatedPlugin(
                 [descEnumName]: {
                   value: {
                     alias: descEnumName.toLowerCase(),
-                    specs: [[sqlSubselect, false]],
+                    specs: [[sqlOrderExpression, false]],
                   },
                 },
               },
@@ -478,6 +587,21 @@ function PgOrderByRelatedPlugin(
             )}
             where ${sqlKeysMatch(queryBuilder.getTableAlias())}
             )`;
+            const sqlOrderExpression = useJoinsForRelationPath
+              ? ({ queryBuilder }) => {
+                  const relatedAlias = joinedAliasForRelationPath(
+                    queryBuilder,
+                    relationPath
+                  );
+                  return sql.fragment`case
+                    when (${relatedAlias} is null) then null
+                    else ${sql.identifier(
+                      proc.namespace.name,
+                      proc.name
+                    )}(${relatedAlias})
+                  end`;
+                }
+              : sqlSubselect;
 
             memo = extend(
               memo,
@@ -485,7 +609,7 @@ function PgOrderByRelatedPlugin(
                 [ascEnumName]: {
                   value: {
                     alias: ascEnumName.toLowerCase(),
-                    specs: [[sqlSubselect, true]],
+                    specs: [[sqlOrderExpression, true]],
                   },
                 },
               },
@@ -499,7 +623,7 @@ function PgOrderByRelatedPlugin(
                 [descEnumName]: {
                   value: {
                     alias: descEnumName.toLowerCase(),
-                    specs: [[sqlSubselect, false]],
+                    specs: [[sqlOrderExpression, false]],
                   },
                 },
               },
@@ -534,6 +658,13 @@ function PgOrderByRelatedPlugin(
                 nestedRelationPath
               )
             ).reduce((nestedMemo, [enumName, enumValue]) => {
+              if (
+                orderByRelatedUseJoins &&
+                relationPathCanUseJoins(nestedRelationPath)
+              ) {
+                return extend(nestedMemo, { [enumName]: enumValue });
+              }
+
               const [[sqlSubselect, ascending]] = enumValue.value.specs;
               const nestedSqlSubselect = ({ queryBuilder }) => sql.fragment`(
                 select ${sqlSubselect({

@@ -4,7 +4,8 @@
 
 This Graphile Engine plugin adds additional enum values to the `orderBy` argument on connections, allowing you to order by columns in related tables.
 
-> Requires `postgraphile@^4.3.1` or `graphile-build-pg@^4.3.1`
+> Requires `postgraphile@^4.3.1` or `graphile-build-pg@^4.3.1` for the default
+> scalar-subquery mode. Join-backed ordering requires `graphile-build-pg@4.14.0`.
 
 Example:
 
@@ -83,6 +84,78 @@ See the [makeAddInflectorsPlugin documentation](https://www.graphile.org/postgra
 ## Options
 
 When using PostGraphile as a library, the following options can be specified via `graphileBuildOptions`.
+
+### orderByRelatedUseJoins
+
+By default, singular related ordering uses the package's original correlated
+scalar subquery. Set `orderByRelatedUseJoins: true` to order singular
+relationships through QueryBuilder-scoped `LEFT JOIN`s instead:
+
+```js
+postgraphile(pgConfig, schema, {
+  appendPlugins: [PgOrderByRelatedPlugin],
+  graphileBuildOptions: {
+    orderByRelatedUseJoins: true,
+  },
+});
+```
+
+For example, a composite relationship produces SQL in this shape:
+
+```sql
+from root
+left join related as related_alias
+  on root.brand_id = related_alias.brand_id
+ and root.account_owner_id = related_alias.user_id
+order by related_alias.email
+```
+
+Join mode has these constraints:
+
+- It requires `graphile-build-pg@4.14.0`. Access to that version's internal
+  QueryBuilder join storage is isolated in a compatibility helper that fails
+  clearly if the expected structure changes.
+- It applies only when every path segment targets columns covered by a real
+  database primary-key or unique constraint. This includes real forward foreign
+  keys, real reverse one-to-one relationships, and smart forward relationships
+  that target a real unique key. Count, min, max, and other one-to-many
+  aggregate ordering continues to use aggregate subqueries.
+- Joins are always `LEFT JOIN`s. Missing or RLS-hidden related rows therefore
+  leave the root row present with a null ordering value.
+- Composite keys add every corresponding key pair to the join condition.
+  Nested singular paths add one reusable join per path segment. Join reuse is
+  local to one QueryBuilder; relationship filters remain independent.
+- Smart `@unique` and `@primaryKey` declarations are not sufficient for join
+  eligibility because PostgreSQL does not enforce them. Those paths retain the
+  scalar-subquery implementation. Join mode does not use `distinct`, `group by`,
+  or `limit 1` to hide duplicate related rows. Smart uniqueness should still
+  describe genuinely unique output because PostGraphile exposes the relation as
+  singular, but join mode does not rely on that declaration.
+
+Join-backed ordering is supported for the application's `first` plus `offset`
+connection path, including `totalCount`. It does **not** support `before`,
+`after`, `last`, or `pageInfo`. PostGraphile 4 page-info queries do not reliably
+replay joins, and cursor comparisons are not null-aware. Supporting those paths
+requires changes in PostGraphile core.
+
+In the consuming application benchmark that motivated this option, the
+correlated form took approximately 58 ms and the equivalent set-based join took
+7.94 ms. This is workload-specific; the test suite asserts SQL shape and
+results, not timing.
+
+### orderByRelatedMaxDepth
+
+Controls the maximum singular relationship path depth. The default is `1`; the
+accepted range is `1` through `5`. A table can override the global setting with
+an `@orderByRelatedMaxDepth` smart tag.
+
+```js
+postgraphile(pgConfig, schema, {
+  graphileBuildOptions: {
+    orderByRelatedMaxDepth: 3,
+  },
+});
+```
 
 ### orderByRelatedColumnAggregates
 
