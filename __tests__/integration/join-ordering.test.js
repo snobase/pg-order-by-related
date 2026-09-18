@@ -26,6 +26,38 @@ const scalarOptions = {
 const compactSql = (text) => text.replace(/\s+/g, " ").trim();
 const leftJoinCount = (text) => (text.match(/\bleft join\b/gi) || []).length;
 
+async function executeQuery(pgClient, schema, source, variableValues) {
+  const statements = [];
+  const query = pgClient.query;
+  pgClient.query = function recordedQuery(config, values, callback) {
+    const text = typeof config === "string" ? config : config.text;
+    statements.push({
+      text: compactSql(text),
+      values: typeof config === "string" ? values : config.values,
+    });
+    return query.call(this, config, values, callback);
+  };
+  try {
+    const result = await graphql(
+      schema,
+      source,
+      null,
+      { pgClient },
+      variableValues
+    );
+    if (result.errors) {
+      throw result.errors[0];
+    }
+    return {
+      data: JSON.parse(JSON.stringify(result.data)),
+      sql: statements.map(({ text }) => text).join("\n"),
+      statements,
+    };
+  } finally {
+    pgClient.query = query;
+  }
+}
+
 let fixtures;
 
 beforeAll(async () => {
@@ -45,27 +77,7 @@ beforeAll(async () => {
       joinOptions
     );
 
-    const execute = async (schema, source) => {
-      const statements = [];
-      const query = pgClient.query;
-      pgClient.query = function recordedQuery(config, values, callback) {
-        const text = typeof config === "string" ? config : config.text;
-        statements.push(compactSql(text));
-        return query.call(this, config, values, callback);
-      };
-      try {
-        const result = await graphql(schema, source, null, { pgClient });
-        if (result.errors) {
-          throw result.errors[0];
-        }
-        return {
-          data: JSON.parse(JSON.stringify(result.data)),
-          sql: statements.join("\n"),
-        };
-      } finally {
-        pgClient.query = query;
-      }
-    };
+    const execute = (schema, source) => executeQuery(pgClient, schema, source);
 
     const orderByEmail =
       "RELATED_ACCOUNT_BY_BRAND_ID_AND_OWNER_USER_ID__EMAIL_ASC";
@@ -319,4 +331,173 @@ test("compiled SQL uses LEFT JOIN and no correlated ordering subquery", () => {
   expect(fixtures.forwardAsc.sql).not.toContain(
     'order by ( select "email" from "j"."related_account"'
   );
+});
+
+test("join-backed cursors and page checks preserve nested, composite and computed ordering", async () => {
+  await withPgClient(async (pgClient) => {
+    await pgClient.query(await readFile(`${__dirname}/../p-data.sql`, "utf8"));
+    const scalarSchema = await createPostGraphileSchema(
+      pgClient,
+      ["j"],
+      scalarOptions
+    );
+    const joinSchema = await createPostGraphileSchema(
+      pgClient,
+      ["j"],
+      joinOptions
+    );
+    const selection = `{ totalCount nodes { id } pageInfo { startCursor endCursor hasNextPage hasPreviousPage } }`;
+
+    for (const order of [
+      "RELATED_ACCOUNT_BY_BRAND_ID_AND_OWNER_USER_ID__EMAIL_ASC",
+      "RELATED_ACCOUNT_BY_BRAND_ID_AND_OWNER_USER_ID__SORT_KEY_ASC",
+      "ROOT_PROFILE_BY_ROOT_ID__LABEL_DESC",
+      "TEAM_BY_TEAM_ID__NAME_ASC, REGION_BY_REGION_ID__NAME_DESC",
+    ]) {
+      const source = `query($first: Int, $last: Int, $after: Cursor, $before: Cursor, $offset: Int) {
+        allRoots(condition: { brandId: 1 }, orderBy: [${order}, ID_ASC], first: $first, last: $last, after: $after, before: $before, offset: $offset) ${selection}
+      }`;
+      const baseline = await executeQuery(pgClient, scalarSchema, source);
+      const first = await executeQuery(pgClient, scalarSchema, source, {
+        first: 1,
+      });
+      const last = await executeQuery(pgClient, scalarSchema, source, {
+        last: 1,
+      });
+      for (const variables of [
+        { first: 1 },
+        { first: 1, offset: 1 },
+        { last: 1 },
+        { first: 0 },
+        {},
+        { first: 1, after: first.data.allRoots.pageInfo.endCursor },
+        { last: 1, before: last.data.allRoots.pageInfo.startCursor },
+        { before: last.data.allRoots.pageInfo.startCursor },
+        { after: first.data.allRoots.pageInfo.endCursor },
+      ]) {
+        const scalar = await executeQuery(
+          pgClient,
+          scalarSchema,
+          source,
+          variables
+        );
+        const joined = await executeQuery(
+          pgClient,
+          joinSchema,
+          source,
+          variables
+        );
+        expect(joined.data).toEqual(scalar.data);
+        expect(joined.sql).toMatch(/left join/);
+      }
+
+      const forwards = [];
+      let after;
+      for (let page = 0; page < 3; page++) {
+        const {
+          data: { allRoots },
+        } = await executeQuery(pgClient, joinSchema, source, {
+          first: 1,
+          after,
+        });
+        forwards.push(...allRoots.nodes);
+        expect(allRoots.pageInfo.hasNextPage).toBe(page < 2);
+        after = allRoots.pageInfo.endCursor;
+      }
+      expect(forwards).toEqual(baseline.data.allRoots.nodes);
+
+      const backwards = [];
+      let before;
+      for (let page = 0; page < 3; page++) {
+        const {
+          data: { allRoots },
+        } = await executeQuery(pgClient, joinSchema, source, {
+          last: 1,
+          before,
+        });
+        backwards.unshift(...allRoots.nodes);
+        expect(allRoots.pageInfo.hasPreviousPage).toBe(page < 2);
+        before = allRoots.pageInfo.startCursor;
+      }
+      expect(backwards).toEqual(baseline.data.allRoots.nodes);
+    }
+  });
+});
+
+test("page information retains missing relations and does not call computed functions on missing rows", async () => {
+  await withPgClient(async (pgClient) => {
+    await pgClient.query(await readFile(`${__dirname}/../p-data.sql`, "utf8"));
+    const schema = await createPostGraphileSchema(pgClient, ["j"], joinOptions);
+    const { data } = await executeQuery(
+      pgClient,
+      schema,
+      `{
+      allRoots(first: 1, offset: 4, orderBy: [RELATED_ACCOUNT_BY_BRAND_ID_AND_OWNER_USER_ID__SORT_KEY_ASC, ID_ASC]) {
+        totalCount nodes { id } pageInfo { hasNextPage hasPreviousPage }
+      }
+    }`
+    );
+    expect(data.allRoots).toEqual({
+      totalCount: 5,
+      nodes: [{ id: 4 }],
+      pageInfo: { hasNextPage: false, hasPreviousPage: true },
+    });
+  });
+});
+
+test("cursor bounds use the main sorting joins without per-row subplans", async () => {
+  await withPgClient(async (pgClient) => {
+    await pgClient.query(await readFile(`${__dirname}/../p-data.sql`, "utf8"));
+    const scalarSchema = await createPostGraphileSchema(
+      pgClient,
+      ["j"],
+      scalarOptions
+    );
+    const joinSchema = await createPostGraphileSchema(
+      pgClient,
+      ["j"],
+      joinOptions
+    );
+    const source = `query($after: Cursor, $before: Cursor) {
+      allRoots(condition: { brandId: 1 }, orderBy: [RELATED_ACCOUNT_BY_BRAND_ID_AND_OWNER_USER_ID__EMAIL_ASC, ID_ASC], after: $after, before: $before) {
+        nodes { id }
+      }
+    }`;
+    const { data } = await executeQuery(
+      pgClient,
+      scalarSchema,
+      `{
+      allRoots(condition: { brandId: 1 }, orderBy: [RELATED_ACCOUNT_BY_BRAND_ID_AND_OWNER_USER_ID__EMAIL_ASC, ID_ASC]) {
+        pageInfo { startCursor endCursor }
+      }
+    }`
+    );
+    const after = data.allRoots.pageInfo.startCursor;
+    const before = data.allRoots.pageInfo.endCursor;
+    for (const variables of [{ after }, { before }, { after, before }]) {
+      const scalar = await executeQuery(
+        pgClient,
+        scalarSchema,
+        source,
+        variables
+      );
+      const joined = await executeQuery(
+        pgClient,
+        joinSchema,
+        source,
+        variables
+      );
+      expect(joined.data).toEqual(scalar.data);
+      const statement = joined.statements[joined.statements.length - 1];
+      const { rows } = await pgClient.query({
+        text: `explain (format json) ${statement.text}`,
+        values: statement.values,
+      });
+      // InitPlans aggregate the connection once; correlated SubPlans repeat
+      // relation lookups for each root row before applying the page limit.
+      expect(JSON.stringify(rows[0]["QUERY PLAN"])).not.toMatch(
+        /"Subplan Name":"SubPlan /
+      );
+    }
+  });
 });

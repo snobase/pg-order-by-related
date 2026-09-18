@@ -132,11 +132,18 @@ Join mode has these constraints:
   describe genuinely unique output because PostGraphile exposes the relation as
   singular, but join mode does not rely on that declaration.
 
-Join-backed ordering is supported for the application's `first` plus `offset`
-connection path, including `totalCount`. It does **not** support `before`,
-`after`, `last`, or `pageInfo`. PostGraphile 4 page-info queries do not reliably
-replay joins, and cursor comparisons are not null-aware. Supporting those paths
-requires changes in PostGraphile core.
+Join-backed ordering supports `first`, `offset`, `last`, `before`, `after`,
+`totalCount`, and `pageInfo`. PostGraphile 4 reuses cursor values and bounds in
+page checks without replaying the outer sorting joins. The plugin scopes those
+expressions in scalar SELECTs that carry the same singular LEFT JOINs. Main-query
+cursor bounds and ORDER BY use the existing sorting joins directly, avoiding
+per-row join subqueries when filtering a page. This relies on QueryBuilder 4.14
+requesting both bounds for the main query and at most one for a page check.
+Requests without cursor expressions retain their original SQL. Missing and RLS-hidden related records still preserve the root row.
+
+This preserves PostGraphile 4's existing cursor comparison semantics, including
+its limitation when traversing null ordering values; it does not replace the
+core cursor comparator. Offset pagination and page checks retain null records.
 
 In the consuming application benchmark that motivated this option, the
 correlated form took approximately 58 ms and the equivalent set-based join took

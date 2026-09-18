@@ -34,6 +34,62 @@ function addQueryBuilderJoinForPostGraphileV4(queryBuilder, join) {
   }
 }
 
+/**
+ * PostGraphile 4 reuses cursor expressions in page checks without the outer
+ * sorting joins. Give cursor values and bounds their own singular LEFT JOIN
+ * scope while retaining direct joined expressions for the main query's bounds
+ * and ORDER BY. A one-row source
+ * preserves missing and RLS-hidden relations as null, just like the main query.
+ */
+function scopeCursorExpressionsForPostGraphileV4(queryBuilder, sql, joins) {
+  const scopeExpression = (expression) => (context) =>
+    sql.fragment`(
+    select ${
+      typeof expression === "function" ? expression(context) : expression
+    }
+    from (values (1)) as ${sql.identifier(
+      Symbol("order_by_related_cursor")
+    )}(value)
+    ${sql.join(joins, " ")}
+  )`;
+  queryBuilder.beforeLock("selectCursor", () => {
+    if (queryBuilder.data.selectCursor) {
+      queryBuilder.selectCursor(
+        scopeExpression(queryBuilder.data.selectCursor)
+      );
+    }
+  });
+  const buildWhereBoundClause =
+    queryBuilder.buildWhereBoundClause.bind(queryBuilder);
+  const buildWhereClause = queryBuilder.buildWhereClause.bind(queryBuilder);
+  queryBuilder.buildWhereBoundClause = (isLower) => {
+    const clause = buildWhereBoundClause(isLower);
+    return queryBuilder.compiledData.whereBound[isLower ? "lower" : "upper"]
+      .length
+      ? scopeExpression(clause)()
+      : clause;
+  };
+  queryBuilder.buildWhereClause = (
+    includeLowerBound,
+    includeUpperBound,
+    options
+  ) => {
+    // The main query has both bounds and the sorting joins. Page checks request
+    // at most one bound and need its joins inside the expression instead.
+    if (
+      includeLowerBound &&
+      includeUpperBound &&
+      (queryBuilder.compiledData.whereBound.lower.length ||
+        queryBuilder.compiledData.whereBound.upper.length)
+    ) {
+      return sql.fragment`(${buildWhereClause(false, false, options)})
+        and (${buildWhereBoundClause(true)})
+        and (${buildWhereBoundClause(false)})`;
+    }
+    return buildWhereClause(includeLowerBound, includeUpperBound, options);
+  };
+}
+
 function PgOrderByRelatedPlugin(
   builder,
   {
@@ -287,7 +343,12 @@ function PgOrderByRelatedPlugin(
     const joinedAliasForRelationPath = (queryBuilder, relationPath) => {
       let joinState = queryBuilder[joinStateSymbol];
       if (!joinState) {
-        joinState = { relations: new Map() };
+        joinState = { relations: new Map(), joins: [] };
+        scopeCursorExpressionsForPostGraphileV4(
+          queryBuilder,
+          sql,
+          joinState.joins
+        );
         Object.defineProperty(queryBuilder, joinStateSymbol, {
           value: joinState,
         });
@@ -301,17 +362,16 @@ function PgOrderByRelatedPlugin(
           const alias = sql.identifier(
             Symbol(`order_by_related_${relationSpec.foreignTable.name}`)
           );
-          addQueryBuilderJoinForPostGraphileV4(
-            queryBuilder,
-            sql.fragment`left join ${sql.identifier(
-              relationSpec.foreignTable.namespace.name,
-              relationSpec.foreignTable.name
-            )} as ${alias} on ${sqlKeysMatchForRelationSpec(
-              relationSpec,
-              sourceAlias,
-              alias
-            )}`
-          );
+          const join = sql.fragment`left join ${sql.identifier(
+            relationSpec.foreignTable.namespace.name,
+            relationSpec.foreignTable.name
+          )} as ${alias} on ${sqlKeysMatchForRelationSpec(
+            relationSpec,
+            sourceAlias,
+            alias
+          )}`;
+          joinState.joins.push(join);
+          addQueryBuilderJoinForPostGraphileV4(queryBuilder, join);
           relationNode = { alias, relations: new Map() };
           relationNodes.set(relationSpec, relationNode);
         }
